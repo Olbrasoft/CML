@@ -1,0 +1,439 @@
+#!/usr/bin/env python3
+"""
+CML Voice-to-OpenCode with Czech PyTorch Model + Whisper
+==========================================================
+1. Listen for "cé em el" wake word using Czech PyTorch model (offline)
+2. Record command after wake word
+3. Transcribe with local Whisper (GPU)
+4. Send to OpenCode
+"""
+
+import sys
+import os
+sys.path.insert(0, os.path.expanduser('~/oc/openwakeword-models'))
+
+from wake_word_detector import CMLWakeWordDetector
+import pyaudio
+import struct
+import subprocess
+import logging
+import tempfile
+import time
+import wave
+import numpy as np
+
+# Setup CUDNN library path for GPU support BEFORE importing WhisperModel
+cudnn_path = os.path.expanduser('~/.local/lib/python3.13/site-packages/nvidia/cudnn/lib')
+cublas_path = os.path.expanduser('~/.local/lib/python3.13/site-packages/nvidia/cublas/lib')
+cuda_runtime_path = os.path.expanduser('~/.local/lib/python3.13/site-packages/nvidia/cuda_runtime/lib')
+if os.path.exists(cudnn_path):
+    os.environ['LD_LIBRARY_PATH'] = f"{cudnn_path}:{cublas_path}:{cuda_runtime_path}:" + os.environ.get('LD_LIBRARY_PATH', '')
+
+try:
+    from faster_whisper import WhisperModel
+except ImportError:
+    print("ERROR: faster-whisper not installed!")
+    print("Run: pip3 install faster-whisper")
+    sys.exit(1)
+
+import speech_recognition as sr
+
+# Configuration
+# Using Czech PyTorch model instead of Porcupine
+WAKE_WORD_PHRASE = "cé em el"  # Czech pronunciation
+OPENCODE_WINDOW_CLASS = "kitty"
+WHISPER_MODEL_SIZE = "medium"  # medium model for better accuracy
+WHISPER_LANGUAGE = "cs"  # Czech
+CONFIRMATION_SOUND = os.path.expanduser("~/oc/voice-output/cache/ano-cml.mp3")
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# Initialize
+recognizer = sr.Recognizer()
+recognizer.pause_threshold = 2.5
+mic = sr.Microphone()
+whisper_model = None
+
+
+def load_whisper_model():
+    """Load Whisper model (lazy loading)."""
+    global whisper_model
+    if whisper_model is None:
+        logging.info(f"🔄 Loading Whisper model ({WHISPER_MODEL_SIZE})...")
+        try:
+            # Try GPU first
+            whisper_model = WhisperModel(
+                WHISPER_MODEL_SIZE,
+                device="cuda",
+                compute_type="float16"
+            )
+            logging.info("✅ Whisper model loaded (GPU)")
+        except Exception as e:
+            logging.warning(f"⚠️  GPU failed: {e}")
+            logging.info("🔄 Falling back to CPU...")
+            whisper_model = WhisperModel(
+                WHISPER_MODEL_SIZE,
+                device="cpu",
+                compute_type="int8"
+            )
+            logging.info("✅ Whisper model loaded (CPU)")
+    return whisper_model
+
+
+def play_confirmation():
+    """Play confirmation sound."""
+    try:
+        # Try pre-generated sound first
+        if os.path.exists(CONFIRMATION_SOUND):
+            subprocess.run(
+                ['mpg123', '-q', CONFIRMATION_SOUND],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+        else:
+            # Fallback: use TTS
+            subprocess.run(
+                [os.path.expanduser('~/oc/voice-output/text-to-speech.sh'), 'Ano?'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+    except Exception as e:
+        logging.warning(f"⚠️  Confirmation sound failed: {e}")
+
+
+def show_notification(title, message):
+    """Show desktop notification."""
+    try:
+        subprocess.run([
+            'notify-send',
+            '-u', 'normal',
+            '-t', '2000',
+            title,
+            message
+        ])
+    except Exception as e:
+        logging.warning(f"⚠️  Notification failed: {e}")
+
+
+def record_command_with_pyaudio(pa):
+    """Record command using PyAudio."""
+    record_start = time.time()
+    logging.info("🎤 Recording command... (speak now)")
+    
+    # Create lock file to prevent TTS from speaking while recording
+    lock_file = "/tmp/microphone-active.lock"
+    temp_file = None
+    frames = []
+    
+    try:
+        # Create lock file
+        with open(lock_file, 'w') as f:
+            f.write(str(os.getpid()))
+        
+        # Open stream for recording
+        stream = pa.open(
+            rate=16000,  # Standard rate for Whisper
+            channels=1,
+            format=pyaudio.paInt16,
+            input=True,
+            frames_per_buffer=1024
+        )
+        
+        # Record for up to 30 seconds or until silence
+        silence_threshold = 800  # Amplitude threshold (increased for better noise rejection)
+        silence_chunks = 0
+        max_silence_chunks = 25  # ~1.7 seconds of silence at 1024 buffer (was 30)
+        max_chunks = 450  # ~30 seconds max
+        
+        for i in range(max_chunks):
+            data = stream.read(1024)
+            frames.append(data)
+            
+            # Simple silence detection
+            audio_data = struct.unpack(f"{1024}h", data)
+            avg_amplitude = sum(abs(x) for x in audio_data) / len(audio_data)
+            
+            # Debug: log amplitude every 2 seconds
+            if i % 30 == 0 and i > 0:
+                logging.debug(f"   Recording: {i*0.064:.1f}s, amplitude: {avg_amplitude:.0f}")
+            
+            if avg_amplitude < silence_threshold:
+                silence_chunks += 1
+                if silence_chunks > max_silence_chunks and i > 10:  # At least 0.5s of audio
+                    logging.info(f"🔇 Silence detected after {i*0.064:.1f}s, stopping")
+                    break
+            else:
+                silence_chunks = 0
+        
+        stream.stop_stream()
+        stream.close()
+        
+        record_time = time.time() - record_start
+        logging.info(f"⏱️  Recording time: {record_time:.2f}s")
+        
+        # Save to WAV file
+        temp_file = tempfile.mktemp(suffix=".wav")
+        with wave.open(temp_file, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(pa.get_sample_size(pyaudio.paInt16))
+            wf.setframerate(16000)
+            wf.writeframes(b''.join(frames))
+        
+        # Remove lock file
+        if os.path.exists(lock_file):
+            os.remove(lock_file)
+        
+        return temp_file
+        
+    except Exception as e:
+        logging.error(f"❌ Recording error: {e}")
+        if temp_file and os.path.exists(temp_file):
+            os.remove(temp_file)
+        # Remove lock file on error
+        if os.path.exists(lock_file):
+            os.remove(lock_file)
+        return None
+
+
+def transcribe_with_whisper(audio_file):
+    """Transcribe audio file with Whisper."""
+    try:
+        start_time = time.time()
+        logging.info("🔄 Transcribing with Whisper...")
+        
+        model_load_start = time.time()
+        model = load_whisper_model()
+        model_load_time = time.time() - model_load_start
+        logging.info(f"⏱️  Model load time: {model_load_time:.2f}s")
+        
+        # Transcribe with advanced settings (same as Caps Lock system)
+        transcribe_start = time.time()
+        segments, info = model.transcribe(
+            audio_file,
+            language=WHISPER_LANGUAGE,
+            beam_size=5,
+            word_timestamps=True,  # Track word timing for better accuracy
+            condition_on_previous_text=True,  # Use context from previous text
+            vad_filter=True  # Voice Activity Detection - filter noise and silence
+        )
+        
+        # Get text
+        text = " ".join([segment.text for segment in segments]).strip()
+        transcribe_time = time.time() - transcribe_start
+        total_time = time.time() - start_time
+        
+        logging.info(f"⏱️  Transcribe time: {transcribe_time:.2f}s")
+        logging.info(f"⏱️  Total time: {total_time:.2f}s")
+        
+        if text and len(text) >= 3:
+            logging.info(f"📝 Transcribed: {text}")
+            return text
+        else:
+            logging.warning("⚠️  Transcription too short or empty")
+            return None
+            
+    except Exception as e:
+        logging.error(f"❌ Transcription error: {e}")
+        return None
+
+
+def find_kitty_socket():
+    """Find the kitty socket file."""
+    try:
+        import glob
+        sockets = glob.glob('/tmp/kitty-socket-*')
+        
+        if not sockets:
+            logging.error("❌ No kitty socket found in /tmp")
+            return None
+        
+        socket_path = sockets[0]
+        logging.info(f"✅ Found kitty socket: {socket_path}")
+        return socket_path
+        
+    except Exception as e:
+        logging.error(f"❌ Error finding kitty socket: {e}")
+        return None
+
+
+def send_to_opencode(text):
+    """Send text to OpenCode using kitten @ and xdotool."""
+    try:
+        # Find kitty socket
+        socket_path = find_kitty_socket()
+        if not socket_path:
+            return False
+        
+        # Read OpenCode window ID from file
+        window_id_file = os.path.expanduser('~/.opencode-window-id')
+        
+        if not os.path.exists(window_id_file):
+            logging.error("❌ OpenCode window ID file not found!")
+            logging.error("   Run 'aic' to start OpenCode and save window ID")
+            return False
+        
+        with open(window_id_file, 'r') as f:
+            opencode_window_id = f.read().strip()
+        
+        if not opencode_window_id:
+            logging.error("❌ OpenCode window ID is empty")
+            return False
+        
+        logging.info(f"✅ Using OpenCode window ID: {opencode_window_id}")
+        
+        # Focus the OpenCode window by ID using kitten @
+        subprocess.run(
+            [
+                'kitten', '@',
+                '--to', f'unix:{socket_path}',
+                'focus-window',
+                '--match', f'id:{opencode_window_id}',
+            ],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        
+        time.sleep(0.1)
+        
+        # Type the text
+        subprocess.run(
+            ['xdotool', 'type', '--delay', '10', '--', text],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        
+        # Press Enter
+        subprocess.run(
+            ['xdotool', 'key', 'Return'],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        
+        logging.info(f"✅ Sent to OpenCode: {text}")
+        return True
+        
+    except subprocess.CalledProcessError as e:
+        logging.error(f"❌ Failed to send to OpenCode: {e}")
+        if e.stderr:
+            logging.error(f"   stderr: {e.stderr}")
+        return False
+    except Exception as e:
+        logging.error(f"❌ Error sending text: {e}")
+        return False
+
+
+def main():
+    print("🎧 CML Voice-to-OpenCode (Czech Edition)")
+    print(f"📁 Wake word model: {WAKE_WORD_PHRASE}")
+    print(f"🤖 Whisper model: {WHISPER_MODEL_SIZE}")
+    print(f"🎤 Listening for '{WAKE_WORD_PHRASE}'...")
+    print("Press Ctrl+C to stop\n")
+    
+    detector = None
+    pa = None
+    audio_stream = None
+    
+    try:
+        # Initialize Czech detector
+        logging.info("⏳ Loading Czech PyTorch model...")
+        detector = CMLWakeWordDetector()
+        detector.THRESHOLD = 0.85  # Zvýšený práh
+        logging.info("✅ Czech model loaded!\n")
+        
+        # Initialize PyAudio
+        pa = pyaudio.PyAudio()
+        audio_stream = pa.open(
+            rate=16000,  # 16kHz for our model
+            channels=1,
+            format=pyaudio.paInt16,
+            input=True,
+            frames_per_buffer=16000  # 1 second chunks
+        )
+        
+        logging.info("✅ System ready, listening for wake word...\n")
+        
+        # Main loop
+        detection_count = 0
+        while True:
+            # Listen for wake word (1 second chunks)
+            audio_data = audio_stream.read(16000, exception_on_overflow=False)
+            audio_array = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32)
+            
+            # Normalize audio to [-1, 1]
+            audio_array = audio_array / 32768.0
+            
+            # Calculate audio level for debugging
+            audio_level = np.abs(audio_array).max()
+            
+            # Detect wake word
+            detected, score = detector.detect(audio=audio_array)
+            
+            # Debug: print every 5 seconds (5 chunks)
+            detection_count += 1
+            if detection_count % 5 == 0:
+                logging.debug(f"Audio level: {audio_level:.4f}, Detection score: {score:.4f}")
+            
+            if detected:
+                logging.info(f"🔔 WAKE WORD DETECTED: {WAKE_WORD_PHRASE} (confidence: {score:.4f})")
+                
+                # Close stream temporarily
+                audio_stream.stop_stream()
+                audio_stream.close()
+                
+                # Play confirmation
+                play_confirmation()
+                
+                # Record command (reuse existing function, just update params)
+                audio_file = record_command_with_pyaudio(pa)
+                
+                if audio_file:
+                    # Transcribe
+                    text = transcribe_with_whisper(audio_file)
+                    
+                    # Cleanup audio file
+                    if os.path.exists(audio_file):
+                        os.remove(audio_file)
+                    
+                    # Send to OpenCode
+                    if text:
+                        send_to_opencode(text)
+                    else:
+                        logging.warning("⚠️  No text to send")
+                else:
+                    logging.error("❌ Recording failed")
+                
+                # Reopen stream for wake word detection
+                audio_stream = pa.open(
+                    rate=16000,
+                    channels=1,
+                    format=pyaudio.paInt16,
+                    input=True,
+                    frames_per_buffer=16000)
+                
+                logging.info(f"🎤 Ready for next '{WAKE_WORD_PHRASE}'...\n")
+                
+    except KeyboardInterrupt:
+        print("\n👋 Stopping listener...")
+    except Exception as e:
+        logging.error(f"❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        if audio_stream is not None:
+            try:
+                audio_stream.close()
+            except:
+                pass
+        if pa is not None:
+            pa.terminate()
+
+
+if __name__ == "__main__":
+    main()

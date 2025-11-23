@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 import wave
+from filelock import FileLock, Timeout
 
 # Setup CUDNN library path for GPU support BEFORE importing WhisperModel
 cudnn_path = os.path.expanduser('~/.local/lib/python3.13/site-packages/nvidia/cudnn/lib')
@@ -42,6 +43,7 @@ OPENCODE_WINDOW_CLASS = "kitty"
 WHISPER_MODEL_SIZE = "medium"  # medium model for better accuracy
 WHISPER_LANGUAGE = "cs"  # Czech
 CONFIRMATION_SOUND = os.path.expanduser("~/oc/voice-output/cache/ano-cml.mp3")
+SPEECH_LOCK_FILE = "/tmp/speech.lock"  # Shared lock file for speech synchronization
 
 # Setup logging
 logging.basicConfig(
@@ -120,16 +122,10 @@ def record_command_with_pyaudio(porcupine, pa):
     """Record command using PyAudio (same stream as Porcupine)."""
     logging.info("🎤 Recording command... (speak now)")
     
-    # Create lock file to prevent TTS from speaking while recording
-    lock_file = "/tmp/microphone-active.lock"
     temp_file = None
     frames = []
     
     try:
-        # Create lock file
-        with open(lock_file, 'w') as f:
-            f.write(str(os.getpid()))
-        
         # Open stream for recording
         stream = pa.open(
             rate=16000,  # Standard rate for Whisper
@@ -139,11 +135,35 @@ def record_command_with_pyaudio(porcupine, pa):
             frames_per_buffer=1024
         )
         
+        # Calibrate noise level - sample first 10 chunks (~0.65 seconds)
+        # Skip first few to let "Ano?" fade out completely
+        logging.info("📊 Calibrating noise level...")
+        noise_samples = []
+        
+        # Discard first 5 chunks (let sound settle more - 0.32s)
+        for _ in range(5):
+            stream.read(1024)
+        
+        # Now measure actual noise
+        for _ in range(10):
+            data = stream.read(1024)
+            audio_data = struct.unpack(f"{1024}h", data)
+            avg_amplitude = sum(abs(x) for x in audio_data) / len(audio_data)
+            noise_samples.append(avg_amplitude)
+        
+        # Calculate AGGRESSIVE threshold for quick cutoff
+        base_noise = sum(noise_samples) / len(noise_samples)
+        max_noise = max(noise_samples)
+        # Use 1.5x avg + 0.5x max (favor avg over spikes)
+        silence_threshold = (base_noise * 1.5 + max_noise * 0.5) / 2
+        silence_threshold = max(silence_threshold, 800)  # Higher minimum threshold for better cutoff
+        silence_threshold = min(silence_threshold, 2000) # Higher cap for noisy environments
+        logging.info(f"📊 Avg noise: {base_noise:.0f}, Max noise: {max_noise:.0f}, Silence threshold: {silence_threshold:.0f}")
+        
         # Record for up to 30 seconds or until silence
-        silence_threshold = 500  # Amplitude threshold
         silence_chunks = 0
-        max_silence_chunks = 30  # ~2 seconds of silence at 1024 buffer
-        max_chunks = 450  # ~30 seconds max
+        max_silence_chunks = 24  # ~1.5 seconds of silence (more aggressive cutoff)
+        max_chunks = 469  # ~30 seconds max
         
         for i in range(max_chunks):
             data = stream.read(1024)
@@ -156,7 +176,7 @@ def record_command_with_pyaudio(porcupine, pa):
             if avg_amplitude < silence_threshold:
                 silence_chunks += 1
                 if silence_chunks > max_silence_chunks and i > 10:  # At least 0.5s of audio
-                    logging.info("🔇 Silence detected, stopping recording")
+                    logging.info(f"🔇 Silence detected (amplitude: {avg_amplitude:.0f} < {silence_threshold:.0f}), stopping recording")
                     break
             else:
                 silence_chunks = 0
@@ -172,19 +192,12 @@ def record_command_with_pyaudio(porcupine, pa):
             wf.setframerate(16000)
             wf.writeframes(b''.join(frames))
         
-        # Remove lock file
-        if os.path.exists(lock_file):
-            os.remove(lock_file)
-        
         return temp_file
         
     except Exception as e:
         logging.error(f"❌ Recording error: {e}")
         if temp_file and os.path.exists(temp_file):
             os.remove(temp_file)
-        # Remove lock file on error
-        if os.path.exists(lock_file):
-            os.remove(lock_file)
         return None
 
 
@@ -221,18 +234,33 @@ def transcribe_with_whisper(audio_file):
 
 
 def find_kitty_socket():
-    """Find the kitty socket file."""
+    """Find the correct kitty socket from saved file."""
     try:
+        import os
+        
+        # Read socket path from file (saved by start-opencode.sh)
+        socket_file = os.path.expanduser('~/.opencode-socket')
+        
+        if os.path.exists(socket_file):
+            with open(socket_file, 'r') as f:
+                socket_listen_on = f.read().strip()
+            
+            # Extract socket path from "unix:/tmp/kitty-socket-xxxxx"
+            if socket_listen_on.startswith('unix:'):
+                socket_path = socket_listen_on[5:]  # Remove "unix:" prefix
+                logging.info(f"✅ Found kitty socket from file: {socket_path}")
+                return socket_path
+        
+        # Fallback: find any socket
         import glob
         sockets = glob.glob('/tmp/kitty-socket-*')
+        if sockets:
+            socket_path = sockets[0]
+            logging.warning(f"⚠️  Socket file not found, using fallback: {socket_path}")
+            return socket_path
         
-        if not sockets:
-            logging.error("❌ No kitty socket found in /tmp")
-            return None
-        
-        socket_path = sockets[0]
-        logging.info(f"✅ Found kitty socket: {socket_path}")
-        return socket_path
+        logging.error("❌ No kitty socket found")
+        return None
         
     except Exception as e:
         logging.error(f"❌ Error finding kitty socket: {e}")
@@ -264,32 +292,29 @@ def send_to_opencode(text):
         
         logging.info(f"✅ Using OpenCode window ID: {opencode_window_id}")
         
-        # Focus the OpenCode window by ID using kitten @
+        # Send text to the specific Kitty window
         subprocess.run(
             [
                 'kitten', '@',
                 '--to', f'unix:{socket_path}',
-                'focus-window',
+                'send-text',
                 '--match', f'id:{opencode_window_id}',
+                text  # Send text without newline
             ],
             capture_output=True,
             text=True,
             check=True
         )
         
-        time.sleep(0.1)
-        
-        # Type the text
+        # Press Enter using send-key
         subprocess.run(
-            ['xdotool', 'type', '--delay', '10', '--', text],
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        
-        # Press Enter
-        subprocess.run(
-            ['xdotool', 'key', 'Return'],
+            [
+                'kitten', '@',
+                '--to', f'unix:{socket_path}',
+                'send-key',
+                '--match', f'id:{opencode_window_id}',
+                'enter'
+            ],
             capture_output=True,
             text=True,
             check=True
@@ -318,6 +343,7 @@ def main():
     porcupine = None
     pa = None
     audio_stream = None
+    processing = False  # Flag to prevent multiple wake word detections
     
     try:
         # Initialize Porcupine
@@ -340,27 +366,65 @@ def main():
         
         # Main loop
         while True:
-            # Listen for wake word
-            pcm = audio_stream.read(porcupine.frame_length)
+            # Listen for wake word (only if not currently processing)
+            pcm = audio_stream.read(porcupine.frame_length, exception_on_overflow=False)
             pcm = struct.unpack_from("h" * porcupine.frame_length, pcm)
             
             keyword_index = porcupine.process(pcm)
             
-            if keyword_index >= 0:
+            if keyword_index >= 0 and not processing:
+                processing = True  # Block further wake word detections
                 logging.info("🔔 WAKE WORD DETECTED: C M L")
                 
-                # Close stream temporarily
+                # Try to acquire lock immediately (non-blocking) to check if someone is speaking
+                lock = FileLock(SPEECH_LOCK_FILE, timeout=0)
+                try:
+                    lock.acquire(timeout=0)  # Try immediately
+                    lock.release()  # Lock was free, release it
+                    logging.info("✅ No one speaking, proceeding normally")
+                except Timeout:
+                    # Lock is held by someone else (TTS is speaking)
+                    logging.warning("⚠️  Speech lock is held - OpenCode is speaking!")
+                    logging.info("🛑 Stopping TTS process...")
+                    
+                    # Kill all audio players that might be playing TTS
+                    subprocess.run(['killall', '-9', 'mpv'], stderr=subprocess.DEVNULL)
+                    subprocess.run(['killall', '-9', 'ffplay'], stderr=subprocess.DEVNULL)
+                    subprocess.run(['killall', '-9', 'play'], stderr=subprocess.DEVNULL)
+                    
+                    # Wait longer for processes to die and lock to be released
+                    time.sleep(1.0)
+                    logging.info("✅ TTS stopped - proceeding with wake word")
+                
+                # LOCK #1: Play confirmation sound "Ano?"
+                lock = FileLock(SPEECH_LOCK_FILE, timeout=10)
+                try:
+                    logging.info("🔒 LOCK #1: Acquiring lock for confirmation sound...")
+                    with lock.acquire(timeout=10):
+                        logging.info("✅ Playing confirmation 'Ano?'")
+                        play_confirmation()
+                        logging.info("🔓 LOCK #1: Released after confirmation")
+                except Timeout:
+                    logging.error("❌ Could not acquire lock for confirmation - timeout")
+                
+                # LOCK #2: Record user's voice command
+                # Need to temporarily stop wake word stream for recording
                 audio_stream.stop_stream()
-                audio_stream.close()
+                try:
+                    logging.info("🔒 LOCK #2: Acquiring lock for recording...")
+                    with lock.acquire(timeout=10):
+                        logging.info("✅ Recording user command - others will wait")
+                        audio_file = record_command_with_pyaudio(porcupine, pa)
+                        logging.info("🔓 LOCK #2: Released after recording")
+                except Timeout:
+                    logging.error("❌ Could not acquire lock for recording - timeout")
+                    audio_file = None
                 
-                # Play confirmation
-                play_confirmation()
+                # Restart wake word stream
+                audio_stream.start_stream()
                 
-                # Record command
-                audio_file = record_command_with_pyaudio(porcupine, pa)
-                
+                # Process transcription (no lock needed - not using audio)
                 if audio_file:
-                    # Transcribe
                     text = transcribe_with_whisper(audio_file)
                     
                     # Cleanup audio file
@@ -375,15 +439,8 @@ def main():
                 else:
                     logging.error("❌ Recording failed")
                 
-                # Reopen stream for wake word detection
-                audio_stream = pa.open(
-                    rate=porcupine.sample_rate,
-                    channels=1,
-                    format=pyaudio.paInt16,
-                    input=True,
-                    frames_per_buffer=porcupine.frame_length)
-                
                 logging.info("🎤 Ready for next wake word...\n")
+                processing = False  # Allow wake word detection again
                 
     except KeyboardInterrupt:
         print("\n👋 Stopping listener...")
