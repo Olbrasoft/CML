@@ -6,9 +6,7 @@ Projekt inspirovaný seriálem Návštěvníci a konceptem Centrálního Mozku L
 
 ### Návštěvníci - Centrální Mozek Lidstva
 
-https://github.com/Olbrasoft/CML/assets/navstevnici-cml.mp4
-
-[Video na YouTube](https://www.youtube.com/watch?v=n7mcrD7erLQ)
+[Stáhnout video](navstevnici-cml.mp4) | [Video na YouTube](https://www.youtube.com/watch?v=n7mcrD7erLQ)
 
 ## O projektu
 
